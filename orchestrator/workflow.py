@@ -46,11 +46,24 @@ def ensure_dirs():
 
 def connect_db():
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL missing in .env or Railway variables.")
+        raise ValueError("DATABASE_URL missing.")
 
     conn = psycopg2.connect(DATABASE_URL)
 
     with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS boards (
+                id SERIAL PRIMARY KEY,
+                ats TEXT,
+                board_slug TEXT,
+                company TEXT,
+                source_url TEXT,
+                first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(ats, board_slug)
+            );
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS jobs_seen (
                 url TEXT PRIMARY KEY,
@@ -73,14 +86,23 @@ def connect_db():
                 country TEXT,
                 source TEXT,
                 posted_date TEXT,
+                date_status TEXT,
                 relevance_bucket TEXT,
                 embedding_score REAL,
                 match_score REAL,
                 recommendation TEXT,
+                matched_skills TEXT,
+                role_category TEXT,
+                level TEXT,
+                match_reason TEXT,
+                risk_flags TEXT,
                 description TEXT,
+                outreach_message TEXT,
                 first_seen_at TIMESTAMPTZ,
                 last_seen_at TIMESTAMPTZ,
-                is_new_24h BOOLEAN
+                is_new_24h BOOLEAN,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
 
@@ -103,8 +125,140 @@ def connect_db():
 
 
 def load_profile():
+    if not os.path.exists(PROFILE_PATH):
+        profile = {
+            "target_roles": [
+                "AI Engineer",
+                "Machine Learning Engineer",
+                "Data Scientist",
+                "Data Analyst",
+                "Business Analyst",
+                "Product Analyst",
+                "Business Intelligence Analyst"
+            ],
+            "skills": [
+                "Python",
+                "SQL",
+                "Machine Learning",
+                "Data Analytics",
+                "Business Analytics",
+                "Power BI",
+                "Tableau",
+                "PostgreSQL",
+                "LLMs",
+                "RAG",
+                "LangChain",
+                "FAISS",
+                "Azure OpenAI"
+            ],
+            "projects": [
+                "VictoryAI job intelligence platform",
+                "RAG system",
+                "Netflix analytics project"
+            ],
+            "experience": [
+                "Business Analytics",
+                "AI",
+                "Data Engineering"
+            ],
+            "education": [
+                "MS Business Analytics and Artificial Intelligence"
+            ]
+        }
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2)
+
+        return profile
+
     with open(PROFILE_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_boards_to_postgres(boards):
+    if not boards:
+        return 0
+
+    conn = connect_db()
+    saved = 0
+
+    with conn.cursor() as cur:
+        for board in boards:
+            ats = board.get("ats", "")
+            board_slug = board.get("board_slug", "")
+            company = board.get("company", "")
+            source_url = board.get("source_url", "")
+
+            if not ats or not board_slug:
+                continue
+
+            cur.execute("""
+                INSERT INTO boards (
+                    ats,
+                    board_slug,
+                    company,
+                    source_url,
+                    last_seen_at
+                )
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (ats, board_slug)
+                DO UPDATE SET
+                    company = EXCLUDED.company,
+                    source_url = EXCLUDED.source_url,
+                    last_seen_at = NOW();
+            """, (
+                ats,
+                board_slug,
+                company,
+                source_url
+            ))
+
+            saved += 1
+
+    conn.commit()
+    conn.close()
+
+    print(f"Saved/updated boards in PostgreSQL: {saved}")
+    return saved
+
+
+def load_boards_from_postgres():
+    conn = connect_db()
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT ats, board_slug, company, source_url
+            FROM boards
+            ORDER BY last_seen_at DESC;
+        """)
+
+        rows = cur.fetchall()
+
+    conn.close()
+
+    boards = [dict(row) for row in rows]
+
+    print(f"Loaded cached boards from PostgreSQL: {len(boards)}")
+    return boards
+
+
+def get_boards():
+    print("Discovering boards with Tavily...")
+
+    try:
+        boards = discover_company_boards(max_results_per_query=100)
+    except Exception as e:
+        print(f"Tavily discovery failed: {e}")
+        boards = []
+
+    if boards:
+        save_boards_to_postgres(boards)
+        return boards
+
+    print("No boards discovered from Tavily. Falling back to cached PostgreSQL boards.")
+    return load_boards_from_postgres()
 
 
 def build_profile_text(profile):
@@ -188,8 +342,7 @@ def is_recent_first_seen(first_seen_at):
         if first_seen.tzinfo is None:
             first_seen = first_seen.replace(tzinfo=timezone.utc)
 
-        cutoff = now_utc() - timedelta(hours=RECENT_HOURS)
-        return first_seen >= cutoff
+        return first_seen >= now_utc() - timedelta(hours=RECENT_HOURS)
     except Exception:
         return False
 
@@ -236,15 +389,21 @@ def update_seen_memory(jobs):
                     url
                 ))
 
-                job["first_seen_at"] = first_seen_at.isoformat()
-                job["last_seen_at"] = current_time.isoformat()
+                job["first_seen_at"] = first_seen_at
+                job["last_seen_at"] = current_time
                 job["is_new_24h"] = is_recent_first_seen(first_seen_at)
 
             else:
                 cur.execute("""
                     INSERT INTO jobs_seen (
-                        url, title, company, location, source,
-                        first_seen_at, last_seen_at, seen_count
+                        url,
+                        title,
+                        company,
+                        location,
+                        source,
+                        first_seen_at,
+                        last_seen_at,
+                        seen_count
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
@@ -258,8 +417,8 @@ def update_seen_memory(jobs):
                     1
                 ))
 
-                job["first_seen_at"] = current_time.isoformat()
-                job["last_seen_at"] = current_time.isoformat()
+                job["first_seen_at"] = current_time
+                job["last_seen_at"] = current_time
                 job["is_new_24h"] = True
 
             if job["is_new_24h"]:
@@ -272,19 +431,54 @@ def update_seen_memory(jobs):
 
 
 def save_jobs_to_postgres(jobs):
+    if not jobs:
+        return 0
+
     conn = connect_db()
+    saved = 0
 
     with conn.cursor() as cur:
         for job in jobs:
+            url = str(job.get("url", "")).strip()
+
+            if not url:
+                continue
+
             cur.execute("""
                 INSERT INTO jobs (
-                    url, title, company, location, country, source,
-                    posted_date, relevance_bucket, embedding_score,
-                    match_score, recommendation, description,
-                    first_seen_at, last_seen_at, is_new_24h
+                    url,
+                    title,
+                    company,
+                    location,
+                    country,
+                    source,
+                    posted_date,
+                    date_status,
+                    relevance_bucket,
+                    embedding_score,
+                    match_score,
+                    recommendation,
+                    matched_skills,
+                    role_category,
+                    level,
+                    match_reason,
+                    risk_flags,
+                    description,
+                    outreach_message,
+                    first_seen_at,
+                    last_seen_at,
+                    is_new_24h,
+                    updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT(url)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, NOW()
+                )
+                ON CONFLICT (url)
                 DO UPDATE SET
                     title = EXCLUDED.title,
                     company = EXCLUDED.company,
@@ -292,33 +486,53 @@ def save_jobs_to_postgres(jobs):
                     country = EXCLUDED.country,
                     source = EXCLUDED.source,
                     posted_date = EXCLUDED.posted_date,
+                    date_status = EXCLUDED.date_status,
                     relevance_bucket = EXCLUDED.relevance_bucket,
                     embedding_score = EXCLUDED.embedding_score,
                     match_score = EXCLUDED.match_score,
                     recommendation = EXCLUDED.recommendation,
+                    matched_skills = EXCLUDED.matched_skills,
+                    role_category = EXCLUDED.role_category,
+                    level = EXCLUDED.level,
+                    match_reason = EXCLUDED.match_reason,
+                    risk_flags = EXCLUDED.risk_flags,
                     description = EXCLUDED.description,
+                    outreach_message = EXCLUDED.outreach_message,
                     last_seen_at = EXCLUDED.last_seen_at,
-                    is_new_24h = EXCLUDED.is_new_24h;
+                    is_new_24h = EXCLUDED.is_new_24h,
+                    updated_at = NOW();
             """, (
-                job.get("url", ""),
+                url,
                 job.get("title", ""),
                 job.get("company", ""),
                 job.get("location", ""),
                 job.get("country", "USA"),
                 job.get("source", ""),
                 job.get("posted_date", ""),
+                job.get("date_status", ""),
                 job.get("relevance_bucket", ""),
                 float(job.get("embedding_score", 0) or 0),
                 float(job.get("match_score", 0) or 0),
                 job.get("recommendation", ""),
+                job.get("matched_skills", ""),
+                job.get("role_category", ""),
+                job.get("level", ""),
+                job.get("match_reason", ""),
+                job.get("risk_flags", ""),
                 job.get("description", ""),
+                job.get("outreach_message", ""),
                 job.get("first_seen_at"),
                 job.get("last_seen_at"),
-                bool(job.get("is_new_24h", False))
+                bool(job.get("is_new_24h", False)),
             ))
+
+            saved += 1
 
     conn.commit()
     conn.close()
+
+    print(f"Saved/updated jobs in PostgreSQL: {saved}")
+    return saved
 
 
 def add_outreach(jobs, profile):
@@ -342,12 +556,28 @@ def save_outputs(jobs):
 
     if df.empty:
         df = pd.DataFrame(columns=[
-            "title", "company", "country", "location", "source", "url",
-            "posted_date", "date_status", "first_seen_at", "last_seen_at",
-            "is_new_24h", "relevance_bucket", "embedding_score",
-            "match_score", "recommendation", "matched_skills",
-            "role_category", "level", "match_reason", "risk_flags",
-            "description", "outreach_message"
+            "title",
+            "company",
+            "country",
+            "location",
+            "source",
+            "url",
+            "posted_date",
+            "date_status",
+            "first_seen_at",
+            "last_seen_at",
+            "is_new_24h",
+            "relevance_bucket",
+            "embedding_score",
+            "match_score",
+            "recommendation",
+            "matched_skills",
+            "role_category",
+            "level",
+            "match_reason",
+            "risk_flags",
+            "description",
+            "outreach_message"
         ])
 
     df.to_csv(APPLICATIONS_PATH, index=False, encoding="utf-8")
@@ -357,7 +587,8 @@ def save_outputs(jobs):
         if col in df.columns
     ]
 
-    df[outreach_cols].to_csv(OUTREACH_PATH, index=False, encoding="utf-8")
+    if outreach_cols:
+        df[outreach_cols].to_csv(OUTREACH_PATH, index=False, encoding="utf-8")
 
     return df
 
@@ -419,6 +650,7 @@ def save_summary(jobs, all_clean_count, df, started_at):
         json.dump(summary, f, indent=2)
 
     save_run_to_postgres(summary)
+
     print(summary)
 
 
@@ -433,7 +665,14 @@ def main():
 
     profile = load_profile()
 
-    boards = discover_company_boards(max_results_per_query=100)
+    boards = get_boards()
+
+    if not boards:
+        print("No boards available from Tavily or PostgreSQL cache.")
+        df = save_outputs([])
+        save_summary([], 0, df, started_at)
+        return
+
     jobs_df = search_jobs_from_boards(boards)
 
     if jobs_df.empty:
@@ -455,7 +694,6 @@ def main():
 
     final_jobs = add_outreach(scored_jobs, profile)
 
-    print("Saving full job records to PostgreSQL...")
     save_jobs_to_postgres(final_jobs)
 
     df = save_outputs(final_jobs)
