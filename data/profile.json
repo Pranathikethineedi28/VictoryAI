@@ -1,0 +1,26 @@
+{
+  "target_roles": [
+    "Data Analyst",
+    "Business Analyst",
+    "Product Analyst",
+    "Data Scientist",
+    "Machine Learning Engineer",
+    "AI Engineer",
+    "Business Intelligence Analyst"
+  ],
+  "skills": [
+    "Python",
+    "SQL",
+    "Power BI",
+    "Tableau",
+    "Excel",
+    "Machine Learning",
+    "Data Analytics",
+    "Business Analytics",
+    "Pandas",
+    "Scikit-learn",
+    "LangChain",
+    "RAG",
+    "FAISS"
+  ]
+}

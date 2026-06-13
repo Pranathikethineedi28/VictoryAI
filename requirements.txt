@@ -1,0 +1,11 @@
+pandas
+requests
+beautifulsoup4
+python-dotenv
+tavily-python
+streamlit
+sentence-transformers
+scikit-learn
+psycopg2-binary
+pycountry
+us
